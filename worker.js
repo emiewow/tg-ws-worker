@@ -1,9 +1,5 @@
 import { connect } from "cloudflare:sockets";
 
-/**
- * Преобразование входящих данных любого формата (ArrayBuffer, Uint8Array, string, Blob)
- * в типизированный байтовый массив Uint8Array для записи в TCP-сокет.
- */
 async function toBytes(data) {
 	if (data instanceof ArrayBuffer) {
 		return new Uint8Array(data);
@@ -22,7 +18,6 @@ async function toBytes(data) {
 
 export default {
 	async fetch(request, env, ctx) {
-		// Проверка протокола WebSocket
 		const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
 		if (upgradeHeader !== "websocket") {
 			return new Response("Telegram WebSocket Proxy Worker is running.\n", {
@@ -41,13 +36,11 @@ export default {
 			return new Response("Missing dst", { status: 400 });
 		}
 
-		// Создаем пару сокетов WebSocket
 		const pair = new WebSocketPair();
 		const client = pair[0];
 		const server = pair[1];
 		server.accept();
 
-		// Устанавливаем прямое TCP-соединение с дата-центром Telegram на порт 443
 		let socket;
 		try {
 			socket = connect({ hostname: dst, port: 443 });
@@ -59,31 +52,21 @@ export default {
 		const tcpReader = socket.readable.getReader();
 		const tcpWriter = socket.writable.getWriter();
 
-		// Очередь для последовательной записи в TCP-сокет (предотвращает коллизии параллельных записей)
-		let writeQueue = Promise.resolve();
-
-		server.addEventListener("message", (event) => {
-			writeQueue = writeQueue
-				.then(async () => {
-					const bytes = await toBytes(event.data);
-					if (bytes.length > 0) {
-						await tcpWriter.write(bytes);
-					}
-				})
-				.catch(() => {
-					try {
-						server.close(1011, "tcp write failed");
-					} catch {}
-					try {
-						socket.close();
-					} catch {}
-				});
+		server.addEventListener("message", async (event) => {
+			try {
+				const bytes = await toBytes(event.data);
+				if (bytes.length > 0) {
+					await tcpWriter.ready;
+					await tcpWriter.write(bytes);
+				}
+			} catch {
+				try {
+					server.close(1011, "tcp write failed");
+				} catch {}
+			}
 		});
 
 		server.addEventListener("close", async () => {
-			try {
-				await writeQueue;
-			} catch {}
 			try {
 				await tcpWriter.close();
 			} catch {}
@@ -98,8 +81,7 @@ export default {
 			} catch {}
 		});
 
-		// Чтение входящего потока от Telegram DC и отправка клиенту через WebSocket
-		const pumpFromTelegram = (async () => {
+		const pump = (async () => {
 			try {
 				while (true) {
 					const { value, done } = await tcpReader.read();
@@ -124,8 +106,9 @@ export default {
 			}
 		})();
 
-		// ctx.waitUntil удерживает воркер в активном состоянии и защищает от 15-секундного таймаута
-		ctx.waitUntil(Promise.allSettled([pumpFromTelegram, writeQueue]));
+		if (ctx && ctx.waitUntil) {
+			ctx.waitUntil(pump);
+		}
 
 		return new Response(null, { status: 101, webSocket: client });
 	},
